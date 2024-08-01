@@ -1,0 +1,3 @@
+[submodule "dronecan/dsdl_specs"]
+	path = dronecan/dsdl_specs
+	url = git@github.com:aviant-tech/DSDL.git
