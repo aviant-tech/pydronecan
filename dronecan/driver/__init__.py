@@ -13,6 +13,7 @@ from .python_can import PythonCAN
 from .slcan import SLCAN
 from .mcast import mcast
 from .file import file
+from .fdcanusb import Fdcanusb
 try:
     from .mavcan import MAVCAN
     have_mavcan = True
@@ -52,6 +53,8 @@ def make_driver(device_name, **kwargs):
         return MAVCAN(device_name[7:], **kwargs)
     elif device_name.startswith("slcan:"):
         return SLCAN(device_name[6:], **kwargs)
+    elif device_name.startswith("fdcanusb:"):
+        return Fdcanusb(device_name[9:], **kwargs)
     elif device_name.startswith("mcast:"):
         return mcast(device_name[6:], **kwargs)
     elif device_name.startswith("filein:"):

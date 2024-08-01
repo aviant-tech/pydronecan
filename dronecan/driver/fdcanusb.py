@@ -30,12 +30,12 @@ except ImportError:
 
 logger = getLogger(__name__)
 
-# If PySerial isn't available, we can't support SLCAN
+# If PySerial isn't available, we can't support fdcanusb
 try:
     import serial
 except ImportError:
     serial = None
-    logger.info("Cannot import PySerial; SLCAN will not be available.")
+    logger.info("Cannot import PySerial; fdcanusb will not be available.")
 
 try:
     # noinspection PyUnresolvedReferences
@@ -55,7 +55,7 @@ else:
 
 TX_QUEUE_SIZE = 1000
 
-TIMESTAMP_OVERFLOW_PERIOD = 60          # Defined by SLCAN protocol
+TIMESTAMP_OVERFLOW_PERIOD = 60          # Defined by SLCAN protocol, unsure best for fdcanusb
 
 DEFAULT_BITRATE = 1000000
 DEFAULT_BAUDRATE = 3000000
@@ -233,62 +233,62 @@ class RxWorker:
             data = self._conn.read(self.READ_BUFFER_SIZE)
         return data, ts_mono, ts_real
 
-    def _process_slcan_line(self, line, local_ts_mono, local_ts_real):
-        line = line.strip().strip(NACK).strip(CLI_END_OF_TEXT)
+    def _process_fdcanusb_line(self, line, local_ts_mono, local_ts_real):
+        line = line.strip()
         line_len = len(line)
-
         if line_len < 1:
             return
 
-        canfd = False
-        # Checking the header, ignore all irrelevant lines
-        if line[0] == b'T'[0]:
-            id_len = 8
-        elif line[0] == b't'[0]:
-            id_len = 3
-        elif line[0] == b'D'[0]:
-            id_len = 8
-            canfd = True
-        else:
+        string_data = line.decode('utf-8')
+
+        # Split the line into parts
+        parts = string_data.split()
+
+        if (parts[0] != "rcv"):
             return
 
-        # Parsing ID and DLC
-        packet_id = int(line[1:1 + id_len], 16)
-        packet_len = CANFrame.dlc_to_datalength(int(chr(line[1 + id_len]), 16))
+        if len(parts) < 3:
+            return  # Invalid line format, skip processing
 
-        if canfd:
-            if packet_len > 64 or packet_len < 0:
-                raise DriverError('Invalid packet length')
-        else:
-            if packet_len > 8 or packet_len < 0:
-                raise DriverError('Invalid packet length', packet_len, line[1 + id_len])
+        # Extract the CAN ID and data
+        can_id = int(parts[1], 16)
+        data = packet_data = binascii.a2b_hex(parts[2])
 
-        # Parsing the payload, detecting timestamp
-        # <type> <id> <dlc> <data>         [timestamp]
-        # 1      3|8  1     packet_len * 2 [4]
-        with_timestamp = line_len > (2 + id_len + packet_len * 2)
+        # Initialize flags
+        extended = False
+        canfd = False
 
-        packet_data = binascii.a2b_hex(line[2 + id_len:2 + id_len + packet_len * 2])
+        # Process the flags
+        for flag in parts[3:]:
+            if flag == 'E':
+                extended = True
+            elif flag == 'e':
+                extended = False
+            elif flag == 'F':
+                canfd = True
+            elif flag == 'f':
+                canfd = False
 
-        # Handling the timestamp, if present
-        if with_timestamp:
-            ts_hardware = int(line[-4:], 16) * 1e-3
-            ts_mono = self._ts_estimator_mono.update(ts_hardware, local_ts_mono)
-            ts_real = self._ts_estimator_real.update(ts_hardware, local_ts_real)
-        else:
-            ts_mono = local_ts_mono
-            ts_real = local_ts_real
-
-        frame = CANFrame(packet_id, packet_data, (id_len == 8), ts_monotonic=ts_mono, ts_real=ts_real, canfd=canfd)
+        # Create the CANFrame object with the required fields
+        frame = CANFrame(
+            can_id=can_id,
+            data=data,
+            extended=extended,
+            ts_monotonic=local_ts_mono,
+            ts_real=local_ts_real,
+            canfd=canfd
+        )
+        
+        # Put the frame into the output queue
         self._output_queue.put_nowait(frame)
 
-    def _process_many_slcan_lines(self, lines, ts_mono, ts_real):
+    def _process_many_fdcanusb_lines(self, lines, ts_mono, ts_real):
         for slc in lines:
             # noinspection PyBroadException
             try:
-                self._process_slcan_line(slc, local_ts_mono=ts_mono, local_ts_real=ts_real)
+                self._process_fdcanusb_line(slc, local_ts_mono=ts_mono, local_ts_real=ts_real)
             except Exception:
-                logger.error('Could not process SLCAN line %r', slc, exc_info=True)
+                logger.error('Could not process fdcanusb line %r', slc, exc_info=True)
 
     # noinspection PyBroadException
     def run(self):
@@ -323,23 +323,23 @@ class RxWorker:
 
                 # Processing in normal mode if there's no outstanding command; using much slower CLI mode otherwise
                 if outstanding_command is None:
-                    slcan_lines = data.split(ACK)
-                    slcan_lines, data = slcan_lines[:-1], slcan_lines[-1]
+                    fdcanusb_lines = data.split(ACK)
+                    fdcanusb_lines, data = fdcanusb_lines[:-1], fdcanusb_lines[-1]
 
-                    self._process_many_slcan_lines(slcan_lines, ts_mono=ts_mono, ts_real=ts_real)
+                    self._process_many_fdcanusb_lines(fdcanusb_lines, ts_mono=ts_mono, ts_real=ts_real)
 
-                    del slcan_lines
+                    del fdcanusb_lines
                 else:
                     # TODO This branch contains dirty and poorly tested code. Refactor once the protocol matures.
                     split_lines = data.split(CLI_END_OF_LINE)
                     split_lines, data = split_lines[:-1], split_lines[-1]
 
-                    # Processing the mix of SLCAN and CLI lines
+                    # Processing the mix of fdcanusb and CLI lines
                     for ln in split_lines:
                         tmp = ln.split(ACK)
-                        slcan_lines, cli_line = tmp[:-1], tmp[-1]
+                        fdcanusb_lines, cli_line = tmp[:-1], tmp[-1]
 
-                        self._process_many_slcan_lines(slcan_lines, ts_mono=ts_mono, ts_real=ts_real)
+                        self._process_many_fdcanusb_lines(fdcanusb_lines, ts_mono=ts_mono, ts_real=ts_real)
 
                         # Processing the CLI line
                         logger.debug('Processing CLI response line %r as...', cli_line)
@@ -371,14 +371,14 @@ class RxWorker:
 
                     del split_lines
 
-                    # The remainder may contain SLCAN and CLI lines as well;
-                    # there is no reason not to process SLCAN ones immediately.
+                    # The remainder may contain fdcanusb and CLI lines as well;
+                    # there is no reason not to process fdcanusb ones immediately.
                     # The last byte could be beginning of an \r\n sequence, so it's excluded from parsing.
                     data, last_byte = data[:-1], data[-1:]
-                    slcan_lines = data.split(ACK)
-                    slcan_lines, data = slcan_lines[:-1], slcan_lines[-1] + last_byte
+                    fdcanusb_lines = data.split(ACK)
+                    fdcanusb_lines, data = fdcanusb_lines[:-1], fdcanusb_lines[-1] + last_byte
 
-                    self._process_many_slcan_lines(slcan_lines, ts_mono=ts_mono, ts_real=ts_real)
+                    self._process_many_fdcanusb_lines(fdcanusb_lines, ts_mono=ts_mono, ts_real=ts_real)
 
                 successive_errors = 0
             except Exception as ex:
@@ -408,16 +408,22 @@ class TxWorker:
         self._termination_condition = termination_condition
 
     def _send_frame(self, frame):
-        marker = 'D' if frame.canfd else 'T'
-        dlc_len = CANFrame.datalength_to_dlc(len(frame.data))
-        line = '%s%X%s\r' % (('%c%08X' if frame.extended else 't%03X') % (marker, frame.id),
-                             dlc_len,
-                             binascii.b2a_hex(frame.data).decode('ascii'))
+        send_mode = 'ext' if frame.extended else 'std'
+
+        flag_fdcan = 'F' if frame.canfd else 'f'
+        flag_bitrate_switching = 'b'
+        flag_remote = 'r'
+
+        hex_id = hex(frame.id)
+        hex_data = binascii.b2a_hex(frame.data).decode('ascii')
+
+        line = f"can {send_mode} {hex_id} {hex_data} {flag_fdcan}{flag_bitrate_switching}{flag_remote}\r\n"
 
         self._conn.write(line.encode('ascii'))
         self._conn.flush()
 
     def _execute_command(self, command):
+        return
         logger.info('Executing command line %r', command.command)
         # It is extremely important to write into the queue first, in order to make the RX worker expect the response!
         _pending_command_line_execution_requests.put(command)
@@ -471,9 +477,9 @@ def _init_adapter(conn, bitrate):
         while True:
             b = conn.read(1)
             if not b:
-                raise DriverError('SLCAN ACK timeout')
+                raise DriverError('fdcanusb ACK timeout')
             if b == NACK:
-                raise DriverError('SLCAN NACK in response')
+                raise DriverError('fdcanusb NACK in response')
             if b == ACK:
                 break
             logger.info('Init: Ignoring byte %r while waiting for ACK', b)
@@ -532,7 +538,7 @@ def _init_adapter(conn, bitrate):
                 logger.warning('Init: Could not clear error flags (command not supported by the CAN adapter?): %s', ex)
         except Exception as ex:
             if num_retries > 0:
-                logger.error('Could not init SLCAN adapter, will retry; error was: %s', ex, exc_info=True)
+                logger.error('Could not init fdcanusb adapter, will retry; error was: %s', ex, exc_info=True)
             else:
                 raise ex
             num_retries -= 1
@@ -626,7 +632,7 @@ def _io_process(device,
             # Propagating the exception to the parent process
             rx_queue.put(ex)
 
-    rxthd = threading.Thread(target=rx_thread_wrapper, name='slcan_rx')
+    rxthd = threading.Thread(target=rx_thread_wrapper, name='fdcanusb_rx')
     rxthd.daemon = True
 
     try:
@@ -674,36 +680,16 @@ def _io_process(device,
 #
 # Logic of the main process
 #
-class SLCAN(AbstractDriver):
+class Fdcanusb(AbstractDriver):
     """
-    Driver for SLCAN-compatible CAN bus adapters, with extension to support CLI commands.
-
-    Some info on SLCAN can be found here:
-        - Linux tree: drivers/net/can/slcan.c (http://lxr.free-electrons.com/source/drivers/net/can/slcan.c)
-        - https://files.zubax.com/docs/Generic_SLCAN_API.pdf
-        - http://www.can232.com/docs/canusb_manual.pdf
-        - http://www.fischl.de/usbtin/
-
-    The CLI extension allows to execute arbitrary CLI commands on the adapter. The commands differ from regular SLCAN
-    exchange in the following ways:
-        - CLI commands are echoed back.
-        - Every output line of a CLI command, including echo, is terminated with CR LF (\r\n).
-        - After the last line follows the ASCII End Of Text character (ETX, ^C, ASCII code 0x03) on a separate
-          line (terminated with CR LF).
-        - CLI commands must not begin with whitespace characters.
-    Example:
-        Input command "stat\r\n" may produce the following output lines:
-        - Echo: "stat\r\n"
-        - Data: "First line\r\n", "Second line\r\n", ...
-        - End Of Text marker: "\x03\r\n"
-    Refer to https://kb.zubax.com for more info.
+    Based on the SLCAN driver, with minimal changes in order to support the mjbots fdcanusb adapter
     """
 
     def __init__(self, device_name, **kwargs):
         if not serial:
-            raise RuntimeError("PySerial not imported; SLCAN is not available. Please install PySerial.")
+            raise RuntimeError("PySerial not imported; fdcanusb is not available. Please install PySerial.")
 
-        super(SLCAN, self).__init__()
+        super(Fdcanusb, self).__init__()
 
         self._stopping = False
 
@@ -714,7 +700,7 @@ class SLCAN(AbstractDriver):
         self._cli_command_requests = []     # List of tuples: (command, callback)
 
         # https://docs.python.org/3/howto/logging-cookbook.html
-        self._logging_thread = threading.Thread(target=self._logging_proxy_loop, name='slcan_log_proxy')
+        self._logging_thread = threading.Thread(target=self._logging_proxy_loop, name='fdcanusb_log_proxy')
         self._logging_thread.daemon = True
 
         # Removing all unused stuff, because it breaks inter process communications.
@@ -732,7 +718,7 @@ class SLCAN(AbstractDriver):
         kwargs['log_queue'] = self._log_queue
         kwargs['parent_pid'] = os.getpid()
 
-        self._proc = multiprocessing.Process(target=_io_process, name='slcan_io_process',
+        self._proc = multiprocessing.Process(target=_io_process, name='fdcanusb_io_process',
                                              args=(device_name,), kwargs=kwargs)
         self._proc.daemon = True
         self._proc.start()
@@ -768,7 +754,7 @@ class SLCAN(AbstractDriver):
                 getLogger(record.name).handle(record)
             except Exception as ex:
                 try:
-                    print('SLCAN logging proxy failed:', ex, file=sys.stderr)
+                    print('fdcanusb logging proxy failed:', ex, file=sys.stderr)
                 except Exception:
                     pass
 
@@ -871,7 +857,7 @@ class SLCAN(AbstractDriver):
 
     def execute_cli_command(self, command, callback, timeout=None):
         """
-        Executes an arbitrary CLI command on the SLCAN adapter, assuming that the adapter supports CLI commands.
+        Executes an arbitrary CLI command on the fdcanusb adapter, assuming that the adapter supports CLI commands.
         The callback will be invoked from the method receive() using same thread.
         If the command times out, the callback will be invoked anyway, with 'expired' flag set.
         Args:
