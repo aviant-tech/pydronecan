@@ -471,18 +471,6 @@ def _raise_self_process_priority():
 
 
 def _init_adapter(conn, bitrate):
-    def wait_for_ack():
-        logger.info('Init: Waiting for ACK...')
-        conn.timeout = ACK_TIMEOUT
-        while True:
-            b = conn.read(1)
-            if not b:
-                raise DriverError('fdcanusb ACK timeout')
-            if b == NACK:
-                raise DriverError('fdcanusb NACK in response')
-            if b == ACK:
-                break
-            logger.info('Init: Ignoring byte %r while waiting for ACK', b)
 
     def send_command(cmd):
         logger.info('Init: Sending command %r', cmd)
@@ -505,37 +493,8 @@ def _init_adapter(conn, bitrate):
         try:
             # Sending an empty command in order to reset the adapter's command parser, then discarding all output
             send_command(b'')
-            try:
-                wait_for_ack()
-            except DriverError:
-                pass
             time.sleep(0.1)
             conn.flushInput()
-
-            # Making sure the channel is closed - some adapters may refuse to re-open if the channel is already open
-            send_command(b'C')
-            try:
-                wait_for_ack()
-            except DriverError:
-                pass
-
-            # Setting speed code
-            send_command(('S%d' % speed_code).encode())
-            conn.flush()
-            wait_for_ack()
-
-            # Opening the channel
-            send_command(b'O')
-            conn.flush()
-            wait_for_ack()
-
-            # Clearing error flags
-            send_command(b'F')
-            conn.flush()
-            try:
-                wait_for_ack()
-            except DriverError as ex:
-                logger.warning('Init: Could not clear error flags (command not supported by the CAN adapter?): %s', ex)
         except Exception as ex:
             if num_retries > 0:
                 logger.error('Could not init fdcanusb adapter, will retry; error was: %s', ex, exc_info=True)
